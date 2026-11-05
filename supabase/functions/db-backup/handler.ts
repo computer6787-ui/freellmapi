@@ -37,6 +37,12 @@ function isEncryptedBackup(payload: Uint8Array): boolean {
   return payload.length >= MAGIC.length + 12 + 16 && MAGIC.every((byte, i) => payload[i] === byte);
 }
 
+function toArrayBuffer(payload: Uint8Array): ArrayBuffer {
+  const buffer = new ArrayBuffer(payload.byteLength);
+  new Uint8Array(buffer).set(payload);
+  return buffer;
+}
+
 async function isPrivateBucket(
   config: BackupBridgeConfig,
   fetcher: typeof fetch,
@@ -163,7 +169,7 @@ export function createBackupHandler(
               'Content-Type': 'application/octet-stream',
               'x-upsert': 'true',
             },
-            body: oldPayload,
+            body: toArrayBuffer(oldPayload),
           });
           if (!preserved.ok) return new Response('Existing backup could not be preserved', { status: 502 });
         }
@@ -176,7 +182,7 @@ export function createBackupHandler(
           'Content-Type': 'application/octet-stream',
           'x-upsert': 'true',
         },
-        body: payload,
+        body: toArrayBuffer(payload),
       });
       if (!stored.ok) return new Response('Backup storage unavailable', { status: 502 });
       return new Response(null, { status: 204 });
