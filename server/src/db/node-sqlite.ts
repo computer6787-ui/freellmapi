@@ -75,6 +75,10 @@ export const nodeSqliteFactory: DbFactory = (resolvedPath) => {
     prepare: (sql) => wrapStatement(raw.prepare(sql)),
     exec: (sql) => raw.exec(sql),
     pragma: (source) => raw.prepare(`PRAGMA ${source}`).all(),
+    backup: async (destination) => {
+      const escaped = destination.replace(/'/g, "''");
+      raw.exec(`VACUUM INTO '${escaped}'`);
+    },
     close: () => raw.close(),
     transaction: <F extends (...args: any[]) => unknown>(fn: F): F => {
       const wrapped = function (this: unknown, ...args: Parameters<F>): ReturnType<F> {

@@ -12,6 +12,8 @@ export interface Db {
   // zero-arg transactions and the parameterised form used in routes/embeddings.
   transaction<F extends (...args: any[]) => unknown>(fn: F): F;
   pragma(source: string): unknown;
+  /** Create a consistent SQLite snapshot at destination. */
+  backup?(destination: string): Promise<void>;
   // Optional file metadata, populated when the backing store is better-sqlite3
   // (the default factory passes the raw handle through). Consumers that need a
   // filesystem location (e.g. the dev encryption-key file) must treat absence

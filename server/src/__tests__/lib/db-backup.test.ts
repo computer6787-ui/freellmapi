@@ -1,9 +1,13 @@
+import crypto from 'node:crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { gzipSync } from 'node:zlib';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { backupDbNow, parseHuggingFaceTarget, restoreDbBackupIfNeeded } from '../../lib/db-backup.js';
+import { initDb } from '../../db/index.js';
+import { createUser, userCount } from '../../services/auth.js';
 import { aclEntries } from '../helpers/acl.js';
 
 const ORIGINAL_BACKUP_PATH = process.env.FREEAPI_DB_BACKUP_PATH;
@@ -12,6 +16,7 @@ const ORIGINAL_BACKUP_URL = process.env.FREEAPI_DB_BACKUP_URL;
 const ORIGINAL_BACKUP_KEY = process.env.FREEAPI_DB_BACKUP_KEY;
 const ORIGINAL_BACKUP_TOKEN = process.env.FREEAPI_DB_BACKUP_TOKEN;
 const ORIGINAL_ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+const ORIGINAL_NODE_ENV = process.env.NODE_ENV;
 
 function restoreEnv() {
   if (ORIGINAL_BACKUP_PATH === undefined) delete process.env.FREEAPI_DB_BACKUP_PATH;
@@ -26,16 +31,23 @@ function restoreEnv() {
   else process.env.FREEAPI_DB_BACKUP_TOKEN = ORIGINAL_BACKUP_TOKEN;
   if (ORIGINAL_ENCRYPTION_KEY === undefined) delete process.env.ENCRYPTION_KEY;
   else process.env.ENCRYPTION_KEY = ORIGINAL_ENCRYPTION_KEY;
+  if (ORIGINAL_NODE_ENV === undefined) delete process.env.NODE_ENV;
+  else process.env.NODE_ENV = ORIGINAL_NODE_ENV;
 }
 
 describe('encrypted SQLite backup', () => {
-  afterEach(() => restoreEnv());
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    restoreEnv();
+  });
 
   it('backs up and restores a SQLite file from a configured path', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-'));
     const dbPath = path.join(dir, 'freeapi.db');
     const backupPath = path.join(dir, 'backup.bin');
     process.env.ENCRYPTION_KEY = 'a'.repeat(64);
+    delete process.env.FREEAPI_DB_BACKUP_URL;
+    delete process.env.FREEAPI_DB_BACKUP_TARGET;
     process.env.FREEAPI_DB_BACKUP_PATH = backupPath;
 
     const db = new Database(dbPath);
@@ -54,6 +66,265 @@ describe('encrypted SQLite backup', () => {
     const restored = new Database(dbPath);
     expect((restored.prepare('SELECT name FROM items').get() as { name: string }).name).toBe('survived');
     restored.close();
+  });
+
+  it('snapshots committed WAL data without checkpointing the live database', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-wal-'));
+    const dbPath = path.join(dir, 'freeapi.db');
+    const backupPath = path.join(dir, 'backup.bin');
+    process.env.ENCRYPTION_KEY = 'a'.repeat(64);
+    process.env.FREEAPI_DB_BACKUP_PATH = backupPath;
+
+    const db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    db.pragma('wal_autocheckpoint = 0');
+    db.exec('CREATE TABLE items (name TEXT NOT NULL)');
+    const reader = new Database(dbPath);
+    reader.exec('BEGIN');
+    reader.prepare('SELECT * FROM items').all();
+    db.prepare('INSERT INTO items (name) VALUES (?)').run('wal-only');
+    expect(fs.statSync(`${dbPath}-wal`).size).toBeGreaterThan(0);
+
+    await backupDbNow(db, dbPath);
+    reader.exec('ROLLBACK');
+    reader.close();
+    db.close();
+    fs.rmSync(dbPath);
+
+    expect((await restoreDbBackupIfNeeded(dbPath)).restored).toBe(true);
+    const restored = new Database(dbPath);
+    expect((restored.prepare('SELECT name FROM items').get() as { name: string }).name).toBe('wal-only');
+    restored.close();
+  });
+
+  it('overwrites a previous backup on later runs', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-overwrite-'));
+    const dbPath = path.join(dir, 'freeapi.db');
+    const backupPath = path.join(dir, 'backup.bin');
+    process.env.ENCRYPTION_KEY = 'a'.repeat(64);
+    process.env.FREEAPI_DB_BACKUP_PATH = backupPath;
+    const db = new Database(dbPath);
+    db.exec('CREATE TABLE items (name TEXT NOT NULL)');
+    db.prepare('INSERT INTO items VALUES (?)').run('first');
+    await backupDbNow(db, dbPath);
+    const first = fs.readFileSync(backupPath);
+    db.prepare('INSERT INTO items VALUES (?)').run('second');
+    await backupDbNow(db, dbPath);
+    const second = fs.readFileSync(backupPath);
+    db.close();
+    expect(second.equals(first)).toBe(false);
+  });
+
+  it('rejects a corrupt encrypted payload without installing a database', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-corrupt-'));
+    const dbPath = path.join(dir, 'freeapi.db');
+    const backupPath = path.join(dir, 'backup.bin');
+    process.env.ENCRYPTION_KEY = 'a'.repeat(64);
+    process.env.FREEAPI_DB_BACKUP_PATH = backupPath;
+    const db = new Database(dbPath);
+    db.exec('CREATE TABLE items (name TEXT NOT NULL)');
+    await backupDbNow(db, dbPath);
+    db.close();
+    const encrypted = fs.readFileSync(backupPath);
+    encrypted[encrypted.length - 1] ^= 0xff;
+    fs.writeFileSync(backupPath, encrypted);
+    fs.rmSync(dbPath);
+
+    await expect(restoreDbBackupIfNeeded(dbPath)).rejects.toThrow(/validate or decrypt/);
+    expect(fs.existsSync(dbPath)).toBe(false);
+    expect(fs.readdirSync(dir).some(name => name.endsWith('.restore'))).toBe(false);
+  });
+
+  it('rejects an encrypted payload that does not contain a valid SQLite database', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-invalid-sqlite-'));
+    const dbPath = path.join(dir, 'freeapi.db');
+    const backupPath = path.join(dir, 'backup.bin');
+    const key = Buffer.from('a'.repeat(64), 'hex');
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const encrypted = Buffer.concat([cipher.update(gzipSync(Buffer.from('not sqlite'))), cipher.final()]);
+    process.env.ENCRYPTION_KEY = 'a'.repeat(64);
+    process.env.FREEAPI_DB_BACKUP_PATH = backupPath;
+    fs.writeFileSync(backupPath, Buffer.concat([
+      Buffer.from('FAPIBK1\0'), iv, cipher.getAuthTag(), encrypted,
+    ]));
+
+    await expect(restoreDbBackupIfNeeded(dbPath)).rejects.toThrow(/not a valid SQLite database/);
+    expect(fs.existsSync(dbPath)).toBe(false);
+  });
+
+  it('does not replace an existing database or fetch a remote backup', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-existing-'));
+    const dbPath = path.join(dir, 'freeapi.db');
+    process.env.FREEAPI_DB_BACKUP_URL = 'https://backup.example.test/state';
+    const db = new Database(dbPath);
+    db.exec('CREATE TABLE items (name TEXT NOT NULL); INSERT INTO items VALUES (\'local\')');
+    db.close();
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    expect((await restoreDbBackupIfNeeded(dbPath)).skipped).toBe('database already exists');
+    expect(fetchMock).not.toHaveBeenCalled();
+    const existing = new Database(dbPath);
+    expect((existing.prepare('SELECT name FROM items').get() as { name: string }).name).toBe('local');
+    existing.close();
+    vi.unstubAllGlobals();
+  });
+
+  it('refuses to initialize over an empty database or orphaned WAL sidecar', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-incomplete-local-'));
+    const dbPath = path.join(dir, 'freeapi.db');
+    process.env.FREEAPI_DB_BACKUP_URL = 'https://backup.example.test/state';
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    fs.writeFileSync(dbPath, '');
+
+    await expect(restoreDbBackupIfNeeded(dbPath)).rejects.toThrow(/database file is empty/);
+    fs.rmSync(dbPath);
+    fs.writeFileSync(`${dbPath}-wal`, 'potentially recoverable');
+    await expect(restoreDbBackupIfNeeded(dbPath)).rejects.toThrow(/sidecar files exist/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('does not replace a database created while the remote backup is being fetched', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-restore-race-'));
+    const dbPath = path.join(dir, 'freeapi.db');
+    const backupPath = path.join(dir, 'backup.bin');
+    process.env.ENCRYPTION_KEY = 'a'.repeat(64);
+    process.env.FREEAPI_DB_BACKUP_PATH = backupPath;
+    const source = new Database(backupPath.replace('backup.bin', 'source.db'));
+    source.exec('CREATE TABLE items (name TEXT NOT NULL); INSERT INTO items VALUES (\'remote\')');
+    await backupDbNow(source, source.name);
+    source.close();
+    const payload = fs.readFileSync(backupPath);
+    fs.rmSync(backupPath);
+
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      const local = new Database(dbPath);
+      local.exec('CREATE TABLE items (name TEXT NOT NULL); INSERT INTO items VALUES (\'local\')');
+      local.close();
+      return new Response(payload, { status: 200 });
+    }));
+    process.env.FREEAPI_DB_BACKUP_URL = 'https://backup.example.test/state';
+    delete process.env.FREEAPI_DB_BACKUP_PATH;
+
+    expect((await restoreDbBackupIfNeeded(dbPath)).skipped).toBe('database created during restore');
+    const existing = new Database(dbPath);
+    expect((existing.prepare('SELECT name FROM items').get() as { name: string }).name).toBe('local');
+    existing.close();
+  });
+
+  it('prevents overlapping uploads for one database connection', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-overlap-'));
+    const dbPath = path.join(dir, 'freeapi.db');
+    process.env.ENCRYPTION_KEY = 'a'.repeat(64);
+    process.env.FREEAPI_DB_BACKUP_URL = 'https://backup.example.test/state';
+    let release!: (response: Response) => void;
+    const fetchMock = vi.fn(() => new Promise<Response>(resolve => { release = resolve; }));
+    vi.stubGlobal('fetch', fetchMock);
+    const db = new Database(dbPath);
+    db.exec('CREATE TABLE items (name TEXT NOT NULL)');
+
+    const first = backupDbNow(db, dbPath);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    const second = await backupDbNow(db, dbPath);
+    expect(second.skipped).toBe('backup already in progress');
+    release(new Response(null, { status: 204 }));
+    await first;
+    expect(fetchMock).toHaveBeenCalledOnce();
+    db.close();
+    vi.unstubAllGlobals();
+  });
+
+  it('retries an interrupted upload and succeeds on the next attempt', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-retry-'));
+    const dbPath = path.join(dir, 'freeapi.db');
+    process.env.ENCRYPTION_KEY = 'a'.repeat(64);
+    process.env.FREEAPI_DB_BACKUP_URL = 'https://backup.example.test/state';
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new Error('fetch failed'))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const db = new Database(dbPath);
+    db.exec('CREATE TABLE items (name TEXT NOT NULL)');
+
+    expect((await backupDbNow(db, dbPath)).ok).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    db.close();
+    vi.unstubAllGlobals();
+  });
+
+  it('fails clearly when the remote service is unavailable', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-unavailable-'));
+    const dbPath = path.join(dir, 'freeapi.db');
+    process.env.FREEAPI_DB_BACKUP_URL = 'https://user:secret@backup.example.test/state?token=private';
+    const fetchMock = vi.fn().mockRejectedValue(new Error('fetch failed'));
+    vi.stubGlobal('fetch', fetchMock);
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    await expect(restoreDbBackupIfNeeded(dbPath)).rejects.toThrow(/could not retrieve remote database backup/);
+    expect(fs.existsSync(dbPath)).toBe(false);
+    expect(errorLog.mock.calls.flat().join(' ')).not.toMatch(/secret|private/);
+    errorLog.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it('reports a missing remote backup without creating a database', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-missing-'));
+    const dbPath = path.join(dir, 'freeapi.db');
+    process.env.FREEAPI_DB_BACKUP_URL = 'https://backup.example.test/state';
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 404 })));
+
+    expect((await restoreDbBackupIfNeeded(dbPath)).skipped).toBe('no backup found');
+    expect(fs.existsSync(dbPath)).toBe(false);
+    vi.unstubAllGlobals();
+  });
+
+  it('rejects backups encrypted with a different key', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-key-'));
+    const dbPath = path.join(dir, 'freeapi.db');
+    const backupPath = path.join(dir, 'backup.bin');
+    process.env.ENCRYPTION_KEY = 'a'.repeat(64);
+    process.env.FREEAPI_DB_BACKUP_PATH = backupPath;
+    const db = new Database(dbPath);
+    db.exec('CREATE TABLE items (name TEXT NOT NULL)');
+    await backupDbNow(db, dbPath);
+    db.close();
+    process.env.ENCRYPTION_KEY = 'b'.repeat(64);
+    fs.rmSync(dbPath);
+
+    await expect(restoreDbBackupIfNeeded(dbPath)).rejects.toThrow(/validate or decrypt/);
+    expect(fs.existsSync(dbPath)).toBe(false);
+  });
+
+  it('restores profiles and seeded models before running fresh initialization', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-db-backup-startup-order-'));
+    const sourcePath = path.join(dir, 'source.db');
+    const targetPath = path.join(dir, 'restored.db');
+    const backupPath = path.join(dir, 'backup.bin');
+    process.env.ENCRYPTION_KEY = 'a'.repeat(64);
+    process.env.FREEAPI_DB_BACKUP_PATH = backupPath;
+    process.env.NODE_ENV = 'test';
+
+    const source = initDb(sourcePath);
+    createUser('persisted@example.test', 'backup-test-password');
+    const sourceCounts = {
+      profiles: (source.prepare('SELECT COUNT(*) AS count FROM profiles').get() as { count: number }).count,
+      models: (source.prepare('SELECT COUNT(*) AS count FROM models').get() as { count: number }).count,
+    };
+    expect(sourceCounts.profiles).toBeGreaterThan(0);
+    expect(sourceCounts.models).toBeGreaterThan(0);
+    await backupDbNow(source, sourcePath);
+    source.close?.();
+
+    expect((await restoreDbBackupIfNeeded(targetPath)).restored).toBe(true);
+    const restored = initDb(targetPath);
+    expect(userCount()).toBe(1);
+    expect((restored.prepare('SELECT COUNT(*) AS count FROM profiles').get() as { count: number }).count)
+      .toBe(sourceCounts.profiles);
+    expect((restored.prepare('SELECT COUNT(*) AS count FROM models').get() as { count: number }).count)
+      .toBe(sourceCounts.models);
+    restored.close?.();
   });
 });
 

@@ -2,15 +2,17 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { gzipSync, gunzipSync } from 'zlib';
-import type { Db } from '../db/types.js';
+import type { Db, DbFactory } from '../db/types.js';
 import type { Scheduler } from './scheduler.js';
-import { getDefaultDbPath } from '../db/index.js';
+import { defaultDbFactory, getDefaultDbPath } from '../db/index.js';
 import { restrictToOwner } from './file-permissions.js';
 
 const MAGIC = Buffer.from('FAPIBK1\0');
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 30 * 1000;
 const PLACEHOLDER_KEY = 'replace-with-64-char-hex';
+const MAX_UPLOAD_ATTEMPTS = 3;
+const backupInProgress = new Set<string>();
 
 export interface DbBackupResult {
   ok: boolean;
@@ -42,6 +44,23 @@ function backupIntervalMs(): number {
 
 function isHttpTarget(target: string): boolean {
   return target.startsWith('https://') || target.startsWith('http://');
+}
+
+function safeTarget(target: string): string {
+  if (!/^https?:\/\//i.test(target)) return target;
+  try {
+    const url = new URL(target);
+    return `${url.protocol}//${url.host}${url.pathname}`;
+  } catch {
+    return target;
+  }
+}
+
+function safeError(err: unknown): string {
+  let message = err instanceof Error ? err.message : String(err);
+  const token = process.env.FREEAPI_DB_BACKUP_TOKEN?.trim();
+  if (token) message = message.split(token).join('[redacted]');
+  return message.replace(/https?:\/\/[^\s"'<>]+/gi, value => safeTarget(value));
 }
 
 function parseBackupKey(): Buffer {
@@ -176,7 +195,7 @@ async function readTarget(target: string): Promise<Buffer | null> {
   return fs.readFileSync(target);
 }
 
-async function writeTarget(target: string, payload: Buffer): Promise<void> {
+async function writeTargetOnce(target: string, payload: Buffer): Promise<void> {
   if (isHttpTarget(target)) {
     const token = process.env.FREEAPI_DB_BACKUP_TOKEN?.trim();
     const huggingFace = parseHuggingFaceTarget(target);
@@ -206,9 +225,50 @@ async function writeTarget(target: string, payload: Buffer): Promise<void> {
   // .env file on the same host. The mode covers creation; restrictToOwner covers
   // the overwrite case, where an existing file keeps the mode it already had —
   // and covers Windows, where the mode argument is a no-op.
-  fs.writeFileSync(target, payload, { mode: 0o600 });
-  if (!restrictToOwner(target)) {
-    console.warn(`[db-backup] could not restrict permissions on ${target} — it may be readable by other local accounts`);
+  const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporary, payload, { mode: 0o600, flag: 'wx' });
+    if (!restrictToOwner(temporary)) {
+      console.warn(`[db-backup] could not restrict permissions on ${safeTarget(target)} — it may be readable by other local accounts`);
+    }
+    fs.renameSync(temporary, target);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+}
+
+function isTransientUploadFailure(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /\bHTTP 5\d\d\b|\bHF commit HTTP 5\d\d\b|fetch failed|timed out|timeout|ECONNRESET|ECONNREFUSED|EPIPE|UND_ERR_/i.test(message);
+}
+
+async function writeTarget(target: string, payload: Buffer): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await writeTargetOnce(target, payload);
+      return;
+    } catch (err) {
+      if (attempt >= MAX_UPLOAD_ATTEMPTS || !isTransientUploadFailure(err)) throw err;
+      await new Promise(resolve => setTimeout(resolve, 500 * 2 ** (attempt - 1)));
+    }
+  }
+}
+
+function validateSqliteFile(filePath: string): void {
+  const factory: DbFactory = defaultDbFactory();
+  let validationDb: Db | undefined;
+  try {
+    validationDb = factory(filePath);
+    const result = validationDb.pragma('integrity_check') as Array<{ integrity_check?: string }>;
+    if (!Array.isArray(result) || result.length !== 1 || result[0]?.integrity_check !== 'ok') {
+      throw new Error('SQLite integrity check failed');
+    }
+    const tables = validationDb.prepare(
+      "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    ).get() as { count?: number } | undefined;
+    if (!tables || tables.count === 0) throw new Error('SQLite backup contains no application tables');
+  } finally {
+    validationDb?.close?.();
   }
 }
 
@@ -216,28 +276,65 @@ export async function restoreDbBackupIfNeeded(dbPath = getDefaultDbPath()): Prom
   const target = backupTarget();
   if (!target) return { ok: true, skipped: 'not configured' };
   if (dbPath === ':memory:') return { ok: true, target, skipped: 'memory database' };
-  if (fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0) return { ok: true, target, skipped: 'database already exists' };
+  if (fs.existsSync(dbPath)) {
+    if (fs.statSync(dbPath).size === 0) {
+      throw new Error(`local database file is empty at ${safeTarget(dbPath)}; refusing to initialize over a potentially recoverable database`);
+    }
+    return { ok: true, target, skipped: 'database already exists' };
+  }
+  if (fs.existsSync(`${dbPath}-wal`) || fs.existsSync(`${dbPath}-shm`)) {
+    throw new Error(`SQLite sidecar files exist without the database at ${safeTarget(dbPath)}; refusing remote restore to preserve recoverable data`);
+  }
 
-  const payload = await readTarget(target);
-  if (!payload || payload.length === 0) return { ok: true, target, skipped: 'no backup found' };
+  let payload: Buffer | null;
+  try {
+    payload = await readTarget(target);
+  } catch (err) {
+    console.error(`[db-backup] failed to retrieve remote backup from ${safeTarget(target)}: ${safeError(err)}`);
+    throw new Error(`could not retrieve remote database backup from ${safeTarget(target)}: ${safeError(err)}`);
+  }
+  if (!payload || payload.length === 0) {
+    console.warn(`[db-backup] no remote backup found at ${safeTarget(target)}`);
+    return { ok: true, target, skipped: 'no backup found' };
+  }
 
   let restored: Buffer;
   try {
     restored = gunzipSync(decryptBackup(payload));
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
-    throw new Error(`could not restore SQLite backup from ${target}: ${detail}`);
+    console.error(`[db-backup] remote backup validation/decryption failed for ${safeTarget(target)}: ${safeError(err)}`);
+    throw new Error(`could not validate or decrypt database backup from ${safeTarget(target)}: ${safeError(err)}`);
   }
 
-  fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
-  // This is the decrypted database — provider keys and the dashboard password
-  // hash in the clear. connectDb hardens it too, but that is a later call and
-  // sometimes a later process; the file must not be readable in between.
-  fs.writeFileSync(dbPath, restored, { mode: 0o600 });
-  if (!restrictToOwner(dbPath)) {
-    console.warn(`[db-backup] could not restrict permissions on the restored database at ${dbPath}`);
+  const resolvedPath = path.resolve(dbPath);
+  fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+  const temporary = `${resolvedPath}.${process.pid}.${crypto.randomUUID()}.restore`;
+  try {
+    // Keep decrypted credentials protected even before the DB connection hardens its directory.
+    fs.writeFileSync(temporary, restored, { mode: 0o600, flag: 'wx' });
+    if (!restrictToOwner(temporary)) {
+      console.warn('[db-backup] could not restrict permissions on the temporary restored database');
+    }
+    try {
+      validateSqliteFile(temporary);
+    } catch (err) {
+      console.error(`[db-backup] downloaded backup is not a valid SQLite database: ${safeError(err)}`);
+      throw new Error(`downloaded backup is not a valid SQLite database: ${safeError(err)}`);
+    }
+    // link() installs the completed file atomically and fails rather than replacing
+    // a database another process may have created while the remote fetch was running.
+    try {
+      fs.linkSync(temporary, resolvedPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+        return { ok: true, target, skipped: 'database created during restore' };
+      }
+      throw err;
+    }
+  } finally {
+    fs.rmSync(temporary, { force: true });
   }
-  console.log(`[db-backup] restored ${restored.length} bytes from ${target}`);
+  console.log(`[db-backup] restored ${restored.length} bytes from ${safeTarget(target)}`);
   return { ok: true, target, bytes: restored.length, restored: true };
 }
 
@@ -246,25 +343,39 @@ export async function backupDbNow(db: Db, dbPath = getDefaultDbPath()): Promise<
   if (!target) return { ok: true, skipped: 'not configured' };
   if (dbPath === ':memory:') return { ok: true, target, skipped: 'memory database' };
   if (!fs.existsSync(dbPath)) return { ok: false, target, skipped: 'database file missing' };
-
+  const resolvedPath = path.resolve(dbPath);
+  if (backupInProgress.has(resolvedPath)) return { ok: true, target, skipped: 'backup already in progress' };
+  backupInProgress.add(resolvedPath);
+  const snapshot = `${resolvedPath}.${process.pid}.${crypto.randomUUID()}.snapshot`;
   try {
-    db.pragma('wal_checkpoint(TRUNCATE)');
-  } catch {
-    // Best effort: reading the main DB still works for rollback-journal or quiet WAL DBs.
+    if (typeof db.backup === 'function') {
+      await db.backup(snapshot);
+    } else {
+      throw new Error('SQLite driver does not support consistent database backups');
+    }
+    const plain = fs.readFileSync(snapshot);
+    const payload = encryptBackup(gzipSync(plain));
+    try {
+      await writeTarget(target, payload);
+    } catch (err) {
+      console.error(`[db-backup] upload failed to ${safeTarget(target)}: ${safeError(err)}`);
+      throw err;
+    }
+    console.log(`[db-backup] uploaded ${plain.length} bytes to ${safeTarget(target)}`);
+    return { ok: true, target, bytes: plain.length };
+  } finally {
+    backupInProgress.delete(resolvedPath);
+    fs.rmSync(snapshot, { force: true });
+    fs.rmSync(`${snapshot}-wal`, { force: true });
+    fs.rmSync(`${snapshot}-shm`, { force: true });
   }
-
-  const plain = fs.readFileSync(dbPath);
-  const payload = encryptBackup(gzipSync(plain));
-  await writeTarget(target, payload);
-  console.log(`[db-backup] uploaded ${plain.length} bytes to ${target}`);
-  return { ok: true, target, bytes: plain.length };
 }
 
 export function startDbBackupPump(db: Db, scheduler: Scheduler, dbPath = getDefaultDbPath()): (() => void) | null {
   if (!backupTarget()) return null;
   const run = () => {
     void backupDbNow(db, dbPath).catch(err => {
-      console.warn(`[db-backup] ${err instanceof Error ? err.message : err}`);
+      console.warn(`[db-backup] ${safeError(err)}`);
     });
   };
   run();
