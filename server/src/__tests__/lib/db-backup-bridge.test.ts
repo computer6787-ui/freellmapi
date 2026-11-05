@@ -36,8 +36,10 @@ describe('Supabase backup bridge', () => {
       'https://project.supabase.co/storage/v1/object/freeapi-db-backups/freellmapi.db.backup',
       expect.objectContaining({ method: 'GET' }),
     );
-    expect(fetcher.mock.calls[0][1].headers.Authorization).toBe('Bearer service-secret');
-    expect(fetcher.mock.calls[1][1].headers.Authorization).toBe('Bearer service-secret');
+    expect(fetcher.mock.calls[0][1].headers.apikey).toBe('service-secret');
+    expect(fetcher.mock.calls[0][1].headers.Authorization).toBeUndefined();
+    expect(fetcher.mock.calls[1][1].headers.apikey).toBe('service-secret');
+    expect(fetcher.mock.calls[1][1].headers.Authorization).toBeUndefined();
   });
 
   it('rejects malformed or oversized uploads before storage writes', async () => {
@@ -174,6 +176,50 @@ describe('Supabase backup bridge', () => {
       headers: { Authorization: 'Bearer backup-secret' },
     }));
     expect(response.status).toBe(404);
+    expect(await response.text()).toBe('Backup not found');
+  });
+
+  it('maps Supabase NoSuchKey responses to a missing backup', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json({ public: false }))
+      .mockResolvedValueOnce(Response.json({
+        statusCode: '404',
+        error: 'not_found',
+        message: 'Object not found',
+        code: 'NoSuchKey',
+      }, { status: 400 }));
+    const handler = createBackupHandler(config, fetcher);
+    const response = await handler(new Request('https://backup.test/state', {
+      headers: { Authorization: 'Bearer backup-secret' },
+    }));
+
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe('Backup not found');
+  });
+
+  it('allows the first upload when Storage reports NoSuchKey as HTTP 400', async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(Response.json({ public: false }))
+      .mockResolvedValueOnce(Response.json({
+        statusCode: '404',
+        error: 'not_found',
+        message: 'Object not found',
+        code: 'NoSuchKey',
+      }, { status: 400 }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }));
+    const handler = createBackupHandler(config, fetcher);
+    const response = await handler(new Request('https://backup.test/state', {
+      method: 'PUT',
+      headers: {
+        Authorization: 'Bearer backup-secret',
+        'Content-Type': 'application/octet-stream',
+      },
+      body: encryptedBackup,
+    }));
+
+    expect(response.status).toBe(204);
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(fetcher.mock.calls[2][1].method).toBe('PUT');
   });
 
   it('refuses to access an object when the bucket is public', async () => {

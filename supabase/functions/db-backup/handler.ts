@@ -37,6 +37,16 @@ function isEncryptedBackup(payload: Uint8Array): boolean {
   return payload.length >= MAGIC.length + 12 + 16 && MAGIC.every((byte, i) => payload[i] === byte);
 }
 
+function isMissingStorageObject(status: number, errorText: string): boolean {
+  if (status === 404) return true;
+  try {
+    const errorData = JSON.parse(errorText);
+    return errorData.code === 'NoSuchKey' || String(errorData.statusCode) === '404';
+  } catch {
+    return false;
+  }
+}
+
 function toArrayBuffer(payload: Uint8Array): ArrayBuffer {
   const buffer = new ArrayBuffer(payload.byteLength);
   new Uint8Array(buffer).set(payload);
@@ -133,8 +143,22 @@ export function createBackupHandler(
         }
         const selectedUrl = restoringPrevious ? previousUrl : url;
         const stored = await fetcher(selectedUrl, { method: 'GET', headers });
-        if (stored.status === 404) return new Response(null, { status: 404 });
-        if (!stored.ok) return new Response('Backup storage unavailable', { status: 502 });
+        if (stored.status === 404) return new Response('Backup not found', { status: 404 });
+        if (!stored.ok) {
+          const responseText = await stored.text();
+          if (isMissingStorageObject(stored.status, responseText)) {
+            return new Response('Backup not found', { status: 404 });
+          }
+          const errorText = responseText.slice(0, 1000)
+            .split(config.serviceRoleKey).join('[redacted]')
+            .split(config.backupToken).join('[redacted]')
+            .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]');
+          console.error('[db-backup] Storage GET failed:', {
+            status: stored.status,
+            error: errorText,
+          });
+          return new Response('Backup storage unavailable', { status: 502 });
+        }
         return new Response(stored.body, {
           status: 200,
           headers: { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store' },
@@ -153,23 +177,29 @@ export function createBackupHandler(
 
       const current = await fetcher(url, { method: 'GET', headers });
       if (current.status !== 404) {
-        if (!current.ok) return new Response('Existing backup could not be preserved', { status: 502 });
-        const oldPayload = await readBoundedBody(current.body, current.headers.get('content-length'));
-        if (oldPayload instanceof Response || !isEncryptedBackup(oldPayload)) {
-          if (!restoringPrevious) {
-            return new Response('Existing backup is malformed and was not overwritten', { status: 409 });
+        if (!current.ok) {
+          const errorText = await current.text();
+          if (!isMissingStorageObject(current.status, errorText)) {
+            return new Response('Existing backup could not be preserved', { status: 502 });
           }
         } else {
-          const preserved = await fetcher(previousUrl, {
-            method: 'PUT',
-            headers: {
-              ...headers,
-              'Content-Type': 'application/octet-stream',
-              'x-upsert': 'true',
-            },
-            body: toArrayBuffer(oldPayload),
-          });
-          if (!preserved.ok) return new Response('Existing backup could not be preserved', { status: 502 });
+          const oldPayload = await readBoundedBody(current.body, current.headers.get('content-length'));
+          if (oldPayload instanceof Response || !isEncryptedBackup(oldPayload)) {
+            if (!restoringPrevious) {
+              return new Response('Existing backup is malformed and was not overwritten', { status: 409 });
+            }
+          } else {
+            const preserved = await fetcher(previousUrl, {
+              method: 'PUT',
+              headers: {
+                ...headers,
+                'Content-Type': 'application/octet-stream',
+                'x-upsert': 'true',
+              },
+              body: toArrayBuffer(oldPayload),
+            });
+            if (!preserved.ok) return new Response('Existing backup could not be preserved', { status: 502 });
+          }
         }
       }
 
