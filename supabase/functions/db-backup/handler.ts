@@ -52,7 +52,6 @@ async function isPrivateBucket(
   const response = await fetcher(url, {
     method: 'GET',
     headers: {
-      Authorization: `Bearer ${config.serviceRoleKey}`,
       apikey: config.serviceRoleKey,
     },
   });
@@ -124,7 +123,6 @@ export function createBackupHandler(
     const previousUrl = storageObjectUrl(config, `${config.objectPath || 'freellmapi.db.backup'}.previous`);
     const restoringPrevious = new URL(request.url).searchParams.get('version') === 'previous';
     const headers = {
-      Authorization: `Bearer ${config.serviceRoleKey}`,
       apikey: config.serviceRoleKey,
     };
 
